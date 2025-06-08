@@ -1,4 +1,4 @@
-// Copyright 2019 The Go Authors. All rights reserved.
+// Copyright 2016 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -10,18 +10,22 @@
 // representation includes a public key suffix to make multiple signing
 // operations with the same key more efficient. This package refers to the RFC
 // 8032 private key as the “seed”.
+//
+// Operations involving private keys are implemented using constant-time
+// algorithms.
 package ed25519sha3sum512
 
 import (
 	"bytes"
 	"crypto"
 	cryptorand "crypto/rand"
+	"crypto/sha3"
+	"crypto/subtle"
 	"errors"
 	"io"
 	"strconv"
 
 	"filippo.io/edwards25519"
-	"golang.org/x/crypto/sha3"
 )
 
 const (
@@ -47,13 +51,13 @@ func (pub PublicKey) Equal(x crypto.PublicKey) bool {
 	if !ok {
 		return false
 	}
-	return bytes.Equal(pub, xx)
+	return subtle.ConstantTimeCompare(pub, xx) == 1
 }
 
-// PrivateKey is the type of Ed25519 private keys. It implements crypto.Signer.
+// PrivateKey is the type of Ed25519 private keys. It implements [crypto.Signer].
 type PrivateKey []byte
 
-// Public returns the PublicKey corresponding to priv.
+// Public returns the [PublicKey] corresponding to priv.
 func (priv PrivateKey) Public() crypto.PublicKey {
 	publicKey := make([]byte, PublicKeySize)
 	copy(publicKey, priv[32:])
@@ -66,19 +70,18 @@ func (priv PrivateKey) Equal(x crypto.PrivateKey) bool {
 	if !ok {
 		return false
 	}
-	return bytes.Equal(priv, xx)
+	return subtle.ConstantTimeCompare(priv, xx) == 1
 }
 
 // Seed returns the private key seed corresponding to priv. It is provided for
 // interoperability with RFC 8032. RFC 8032's private keys correspond to seeds
 // in this package.
 func (priv PrivateKey) Seed() []byte {
-	seed := make([]byte, SeedSize)
-	copy(seed, priv[:32])
-	return seed
+	return bytes.Clone(priv[:SeedSize])
 }
 
-// Sign signs the given message with priv.
+// Sign signs the given message with priv. rand is ignored and can be nil.
+//
 // Ed25519 performs two passes over messages to be signed and therefore cannot
 // handle pre-hashed messages. Thus opts.HashFunc() must return zero to
 // indicate the message hasn't been hashed. This can be achieved by passing
@@ -91,8 +94,25 @@ func (priv PrivateKey) Sign(rand io.Reader, message []byte, opts crypto.SignerOp
 	return Sign(priv, message), nil
 }
 
+// Options can be used with [PrivateKey.Sign] or [VerifyWithOptions]
+// to select Ed25519 variants.
+type Options struct {
+	// Hash must be zero for Ed25519.
+	Hash crypto.Hash
+
+	// Context, if not empty, selects Ed25519ctx or provides the context string
+	// for Ed25519ph. It can be at most 255 bytes in length.
+	Context string
+}
+
+// HashFunc returns o.Hash.
+func (o *Options) HashFunc() crypto.Hash { return o.Hash }
+
 // GenerateKey generates a public/private key pair using entropy from rand.
-// If rand is nil, crypto/rand.Reader will be used.
+// If rand is nil, [crypto/rand.Reader] will be used.
+//
+// The output of this function is deterministic, and equivalent to reading
+// [SeedSize] bytes from rand, and passing them to [NewKeyFromSeed].
 func GenerateKey(rand io.Reader) (PublicKey, PrivateKey, error) {
 	if rand == nil {
 		rand = cryptorand.Reader
@@ -111,7 +131,7 @@ func GenerateKey(rand io.Reader) (PublicKey, PrivateKey, error) {
 }
 
 // NewKeyFromSeed calculates a private key from a seed. It will panic if
-// len(seed) is not SeedSize. This function is provided for interoperability
+// len(seed) is not [SeedSize]. This function is provided for interoperability
 // with RFC 8032. RFC 8032's private keys correspond to seeds in this
 // package.
 func NewKeyFromSeed(seed []byte) PrivateKey {
@@ -128,9 +148,8 @@ func newKeyFromSeed(privateKey, seed []byte) {
 
 	h := sha3.Sum512(seed)
 	s, err := edwards25519.NewScalar().SetBytesWithClamping(h[:32])
-	// This should never happen.
 	if err != nil {
-		panic(err)
+		panic("ed25519: internal error: setting scalar failed")
 	}
 	A := (&edwards25519.Point{}).ScalarBaseMult(s)
 
@@ -141,7 +160,7 @@ func newKeyFromSeed(privateKey, seed []byte) {
 }
 
 // Sign signs the message with privateKey and returns a signature. It will
-// panic if len(privateKey) is not PrivateKeySize.
+// panic if len(privateKey) is not [PrivateKeySize].
 func Sign(privateKey PrivateKey, message []byte) []byte {
 	// Outline the function body so that the returned signature can be
 	// stack-allocated.
@@ -158,9 +177,8 @@ func sign(signature, privateKey, message []byte) {
 
 	h := sha3.Sum512(seed)
 	s, err := edwards25519.NewScalar().SetBytesWithClamping(h[:32])
-	// This should never happen.
 	if err != nil {
-		panic(err)
+		panic("ed25519: internal error: setting scalar failed")
 	}
 	prefix := h[32:]
 
@@ -170,9 +188,8 @@ func sign(signature, privateKey, message []byte) {
 	messageDigest := make([]byte, 0, mh.Size())
 	messageDigest = mh.Sum(messageDigest)
 	r, err := edwards25519.NewScalar().SetUniformBytes(messageDigest)
-	// This should never happen.
 	if err != nil {
-		panic(err)
+		panic("ed25519: internal error: setting scalar failed")
 	}
 
 	R := (&edwards25519.Point{}).ScalarBaseMult(r)
@@ -184,9 +201,8 @@ func sign(signature, privateKey, message []byte) {
 	hramDigest := make([]byte, 0, kh.Size())
 	hramDigest = kh.Sum(hramDigest)
 	k, err := edwards25519.NewScalar().SetUniformBytes(hramDigest)
-	// This should never happen.
 	if err != nil {
-		panic(err)
+		panic("ed25519: internal error: setting scalar failed")
 	}
 
 	S := edwards25519.NewScalar().MultiplyAdd(k, s, r)
@@ -196,8 +212,36 @@ func sign(signature, privateKey, message []byte) {
 }
 
 // Verify reports whether sig is a valid signature of message by publicKey. It
-// will panic if len(publicKey) is not PublicKeySize.
+// will panic if len(publicKey) is not [PublicKeySize].
+//
+// The inputs are not considered confidential, and may leak through timing side
+// channels, or if an attacker has control of part of the inputs.
 func Verify(publicKey PublicKey, message, sig []byte) bool {
+	return verify(publicKey, message, sig)
+}
+
+// VerifyWithOptions reports whether sig is a valid signature of message by
+// publicKey. A valid signature is indicated by returning a nil error. It will
+// panic if len(publicKey) is not [PublicKeySize].
+//
+// Ed25519 performs two passes over messages to be signed and therefore cannot
+// handle pre-hashed messages. Thus opts.HashFunc() must return zero to
+// indicate the message hasn't been hashed. This can be achieved by passing
+// crypto.Hash(0) as the value for opts.
+//
+// The inputs are not considered confidential, and may leak through timing side
+// channels, or if an attacker has control of part of the inputs.
+func VerifyWithOptions(publicKey PublicKey, message, sig []byte, opts *Options) error {
+	if opts.Hash != crypto.Hash(0) {
+		return errors.New("ed25519: cannot verify hashed message")
+	}
+	if !verify(publicKey, message, sig) {
+		return errors.New("ed25519: invalid signature")
+	}
+	return nil
+}
+
+func verify(publicKey PublicKey, message, sig []byte) bool {
 	if l := len(publicKey); l != PublicKeySize {
 		panic("ed25519: bad public key length: " + strconv.Itoa(l))
 	}
@@ -218,9 +262,8 @@ func Verify(publicKey PublicKey, message, sig []byte) bool {
 	hramDigest := make([]byte, 0, kh.Size())
 	hramDigest = kh.Sum(hramDigest)
 	k, err := edwards25519.NewScalar().SetUniformBytes(hramDigest)
-	// This should never happen.
 	if err != nil {
-		panic(err)
+		panic("ed25519: internal error: setting scalar failed")
 	}
 
 	S, err := edwards25519.NewScalar().SetCanonicalBytes(sig[32:])
