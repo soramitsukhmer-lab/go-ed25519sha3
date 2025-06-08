@@ -13,7 +13,7 @@
 //
 // Operations involving private keys are implemented using constant-time
 // algorithms.
-package ed25519sha3sum512
+package ed25519sha3
 
 import (
 	"bytes"
