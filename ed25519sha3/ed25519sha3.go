@@ -19,11 +19,12 @@ import (
 	"bytes"
 	"crypto"
 	cryptorand "crypto/rand"
-	"crypto/sha3"
 	"crypto/subtle"
 	"errors"
 	"io"
 	"strconv"
+
+	"golang.org/x/crypto/sha3"
 
 	"filippo.io/edwards25519"
 )
